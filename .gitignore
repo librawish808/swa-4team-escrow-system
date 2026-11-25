@@ -7,6 +7,9 @@
 **/.venv/
 **/__pycache__/
 *.pyc
+backend/data/
+**/.ruff_cache/
+**/.ty_cache/
 
 # 환경변수
 **/.env
