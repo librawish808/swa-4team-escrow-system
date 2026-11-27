@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .adapters import MockBankPort, MockDeliveryPort
-from .benchmark import run_qas01
+from .benchmark import run_qas01, run_qas01_stress
 from .domain import DomainError
 from .repository import SqlTransactionRepository
 from .runner import DeadlineRecoveryRunner
@@ -106,6 +106,14 @@ def create_app(database_path=None, carrier_delay_seconds=3.0):
         async with lock:
             # Keep synchronous benchmark setup away from the live deadline loop.
             return await asyncio.to_thread(lambda: asyncio.run(run_qas01()))
+
+    @app.post("/api/demo/qas-01/stress")
+    async def benchmark_stress(request: Request):
+        lock = request.app.state.benchmark_lock
+        if lock.locked():
+            raise DomainError("검증이 이미 실행 중입니다.")
+        async with lock:
+            return await asyncio.to_thread(lambda: asyncio.run(run_qas01_stress()))
 
     return app
 

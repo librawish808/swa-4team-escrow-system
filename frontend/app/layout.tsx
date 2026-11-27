@@ -18,12 +18,19 @@ export const metadata: Metadata = {
   description: "반품 마감 직전 운송장 접수와 자동 지급 경합을 검증하는 에스크로 데모",
 };
 
+const themeInitScript = `try{var v=localStorage.getItem("color-scheme");if(v==="light"||v==="dark"){document.documentElement.dataset.theme=v;var m=document.querySelector('meta[name="color-scheme"]');if(m)m.content=v;}}catch(e){}`;
+
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html
       lang="ko"
+      suppressHydrationWarning
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
+      <head>
+        <meta name="color-scheme" content="light dark" />
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
   );

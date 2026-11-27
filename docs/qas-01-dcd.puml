@@ -1,5 +1,5 @@
 @startuml QAS01_Implementation_DCD
-title QAS-01 신뢰성 구현 DCD · 레이어드 모놀리스
+title QAS-01 신뢰성 및 C 정책 정렬 구현 DCD · 레이어드 모놀리스
 hide empty members
 skinparam classAttributeIconSize 0
 skinparam shadowing false
@@ -15,47 +15,92 @@ package "인터페이스 계층" {
   }
 }
 package "업무 계층" {
-  class TransactionService {
-    +register_return_waybill(...)
-    +evaluate(transaction_id, snapshot)
-    +process_due_deadlines()
-    +verify_receipt(receipt)
-    +dispatch_transfers()
-    +get_transaction_status(...)
+  package "B. Transaction Management" {
+    class TransactionService {
+      +register_return_waybill(...)
+      +evaluate(transaction_id, snapshot)
+      +process_due_deadlines()
+      +verify_receipt(receipt)
+      +dispatch_transfers()
+      +get_transaction_status(...)
+    }
   }
-  class PolicyController {
-    +evaluate(transaction, now): Decision
+  package "C. Policy & Exception (순수 정책 판단)" {
+    interface TransactionPolicy {
+      +validate_join(tx, buyer_id, token): PolicyDecision
+      +validate_waybill(tx, seller_id): PolicyDecision
+      +validate_purchase(tx, buyer_id): PolicyDecision
+      +validate_cancellation(tx, actor_id): PolicyDecision
+      +validate_read(tx, actor_id): PolicyDecision
+    }
+    class PolicyController {
+      +evaluate(request: PolicyRequest, context: PolicyContext): PolicyDecision
+      +evaluate_return_deadline(tx, now): PolicyDecision
+    }
+    class DepositPolicy {
+      +evaluate_deposit(deposit, context): PolicyDecision
+    }
+    class FulfillmentPolicy {
+      +evaluate_shipment(request, context): PolicyDecision
+      +evaluate_confirmation(request, context): PolicyDecision
+    }
+    class CancellationPolicy {
+      +evaluate_cancellation(request, context): PolicyDecision
+    }
+    class ReturnPolicy {
+      +evaluate_issue(request, context): PolicyDecision
+      +evaluate_return(request, context): PolicyDecision
+      +evaluate_shipment_result(...): ReceiptStatus
+    }
+    class FundsPolicy {
+      +evaluate_operation(allocation, request, context): PolicyDecision
+    }
+    class DeadlinePolicy {
+      +deadline_of(start, period)
+      +is_before_deadline(at, deadline)
+      +is_due(at, deadline)
+    }
   }
-  class ReturnPolicy {
-    +evaluate(transaction, now): Decision
-  }
-  class DeadlinePolicy {
-    +deadline_of(notice_published_at)
-    +is_before_deadline(received_at, deadline)
-  }
-  interface DeliveryPort {
-    +get_shipment_status(waybill_no, seller_id): ShipmentResult
-  }
-  interface BankPort {
-    +transfer(operation): str
+  package "External Contracts" {
+    interface DeliveryPort {
+      +register_waybill(tx_id, waybill_no): ShipmentResult
+      +get_shipment_status(waybill_no, seller_id): ShipmentResult
+    }
+    interface BankPort {
+      +check_deposit(tx_id): DepositCheckResult
+      +request_payout(tx_id, request_key, op): TransferResult
+      +request_refund(tx_id, request_key, op): TransferResult
+      +get_transfer_result(request_key): TransferResult
+    }
   }
 }
 package "인프라 계층" {
   class SqlTransactionRepository {
-    +accept_waybill(..., clock)
+    +accept_waybill(..., clock, policy)
     +claim_once(snapshot, decision, now)
     +claim_receipt(now)
-    +finish_receipt(...)
+    +finish_receipt(..., policy)
+    +mark_mock_arrived(..., policy)
     +save_transfer_result(...)
   }
   class MockDeliveryPort
   class MockBankPort
   database "SQLite\ntransactions / receipts / operations\nmock_bank_transfers / events" as DB
 }
+
 Controller --> TransactionService
 DeadlineRecoveryRunner --> TransactionService
-TransactionService --> PolicyController
+TransactionService --> TransactionPolicy : validates
+TransactionService --> PolicyController : evaluate
+PolicyController ..|> TransactionPolicy
+PolicyController --> DepositPolicy
+PolicyController --> FulfillmentPolicy
+PolicyController --> CancellationPolicy
 PolicyController --> ReturnPolicy
+PolicyController --> FundsPolicy
+DepositPolicy --> DeadlinePolicy
+FulfillmentPolicy --> DeadlinePolicy
+CancellationPolicy --> DeadlinePolicy
 ReturnPolicy --> DeadlinePolicy
 TransactionService --> SqlTransactionRepository : Repository + RequestGuard
 TransactionService --> DeliveryPort
@@ -64,15 +109,15 @@ MockDeliveryPort ..|> DeliveryPort
 MockBankPort ..|> BankPort
 MockBankPort --> SqlTransactionRepository : 영속 모의 은행 원장
 SqlTransactionRepository --> DB
+note right of PolicyController
+  모든 승인·거절·보류·택배 결과 해석·
+  조회 권한·이체 후속 판단을 C에서 순수 수행.
+  Repository와 Service는 영속화·조정만 담당.
+end note
 note right of SqlTransactionRepository
   접수 시각·PENDING·버전 원자 저장
   버전 비교·원금 지시 원자 저장
   UNIQUE(transaction_id): 지급/환불 한 자리
   외부 응답 대기 중 DB 잠금 없음
-end note
-note bottom of DeadlineRecoveryRunner
-  하나의 백엔드 프로세스
-  마감 실행과 택배/은행 대기를 분리
-  접수는 DB에 남아 재시작 후 재조회
 end note
 @enduml

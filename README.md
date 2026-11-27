@@ -50,4 +50,4 @@ DB 기본 위치는 `backend/data/escrow.sqlite3`이고 `ESCROW_DB_PATH`로 바�
 
 은행과 택배는 모의 구현이다. `buyer-demo`·`seller-demo`는 시연용 참여자 식별자이며 로그인 인증을 대신하지 않는다. 거래 목록·거래 생성·택배 도착·검증 API는 로컬 시연용이다. 담당자 확인 목록까지 제공하고 수동 판정 UI는 구현하지 않는다.
 
-[QAS-01과 동시성 규칙](docs/QAS-01.md) · [구현 DCD](docs/qas-01-dcd.puml)
+[QAS-01과 동시성 규칙](docs/QAS-01.md) · [구현 DCD](docs/qas-01-dcd.puml) · [C 정렬 검수 기록](docs/c-alignment-audit.md)

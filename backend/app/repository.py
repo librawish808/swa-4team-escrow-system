@@ -1,4 +1,7 @@
-"""SQLite persistence and atomic version/financial guard (DCD: infrastructure)."""
+"""SQLite persistence and atomic version/financial guard (DCD: infrastructure).
+
+Persistence only: all business policy decisions are delegated to PolicyController (C).
+"""
 
 import sqlite3
 from contextlib import closing, contextmanager
@@ -7,13 +10,18 @@ from pathlib import Path
 from uuid import uuid4
 
 from .domain import (
-    DeadlinePolicy,
+    Action,
     Decision,
+    DecisionType,
     DomainError,
+    OperationStatus,
+    PolicyContext,
+    PolicyRequest,
     ReceiptStatus,
     instant,
     timestamp,
 )
+from .policy import DeadlinePolicy, PolicyController
 
 
 class SqlTransactionRepository:
@@ -22,6 +30,7 @@ class SqlTransactionRepository:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(path, isolation_level=None)) as db:
             db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS transactions (
                     id TEXT PRIMARY KEY, seller_id TEXT NOT NULL, buyer_id TEXT NOT NULL,
@@ -42,7 +51,8 @@ class SqlTransactionRepository:
                     transaction_id TEXT NOT NULL UNIQUE REFERENCES transactions(id),
                     kind TEXT NOT NULL CHECK(kind IN ('PAYOUT', 'REFUND')),
                     recipient_id TEXT NOT NULL, amount INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'PENDING'
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    lease_token TEXT, lease_until TEXT
                 );
                 CREATE TABLE IF NOT EXISTS mock_bank_transfers (
                     request_key TEXT PRIMARY KEY, transaction_id TEXT NOT NULL UNIQUE,
@@ -54,12 +64,21 @@ class SqlTransactionRepository:
                     at TEXT NOT NULL, message TEXT NOT NULL
                 );
             """)
+            op_columns = {
+                row[1]
+                for row in db.execute("PRAGMA table_info(operations)").fetchall()
+            }
+            if "lease_token" not in op_columns:
+                db.execute("ALTER TABLE operations ADD COLUMN lease_token TEXT")
+            if "lease_until" not in op_columns:
+                db.execute("ALTER TABLE operations ADD COLUMN lease_until TEXT")
 
     @contextmanager
     def connection(self, *, write=False):
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA synchronous=NORMAL")
         try:
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
@@ -142,29 +161,33 @@ class SqlTransactionRepository:
                 )
             ]
 
-    def accept_waybill(self, transaction_id, actor_id, request_id, waybill_no, clock):
-        # The authoritative receipt is the durable DB acceptance. No client timestamp.
+    def accept_waybill(
+        self, transaction_id, actor_id, request_id, waybill_no, clock, policy=None
+    ):
+        # Single-node linearization point: acquire write lock, read server clock, delegate policy to C.
+        evaluator = policy or PolicyController()
         with self.connection(write=True) as db:
             transaction = self._snapshot(db, transaction_id)
-            if actor_id != transaction["buyer_id"]:
-                raise DomainError("구매자만 반품 운송장을 접수할 수 있습니다.", 403)
-            previous = next(
-                (r for r in transaction["receipts"] if r["request_id"] == request_id),
-                None,
-            )
-            if previous:
-                if previous["waybill_no"] != waybill_no:
-                    raise DomainError(
-                        "같은 요청 ID에 다른 운송장을 사용할 수 없습니다."
-                    )
-                return previous["id"]
             now = clock()
-            if not DeadlinePolicy.is_before_deadline(
-                now, instant(transaction["deadline"])
-            ):
-                raise DomainError("반품 운송장 등록 기한이 지났습니다.")
-            if transaction["operations"]:
-                raise DomainError("이미 지급 또는 환불이 결정된 거래입니다.")
+            decision = evaluator.evaluate(
+                PolicyRequest(
+                    request_id=request_id,
+                    action=Action.REGISTER_RETURN_WAYBILL,
+                    actor_id=actor_id,
+                    received_at=now,
+                    payload={"waybill_no": waybill_no},
+                ),
+                PolicyContext(
+                    now=now,
+                    transaction_version=transaction["version"],
+                    payment_held=True,
+                    transaction=transaction,
+                ),
+            )
+            if decision.verdict == DecisionType.REJECT:
+                raise DomainError(decision.reason, decision.status_code)
+            if Action.REPLAY_RETURN_WAYBILL in decision.actions:
+                return decision.metadata["existing_receipt_id"]
             receipt_id = str(uuid4())
             db.execute(
                 """INSERT INTO receipts
@@ -199,8 +222,8 @@ class SqlTransactionRepository:
             if current["operations"] or decision == Decision.WAIT:
                 return True
             if decision == Decision.HOLD:
-                if current["hold_decided_at"] is None and now >= instant(
-                    current["deadline"]
+                if current["hold_decided_at"] is None and DeadlinePolicy.is_due(
+                    now, instant(current["deadline"])
                 ):
                     db.execute(
                         "UPDATE transactions SET hold_decided_at=?, version=version+1 WHERE id=?",
@@ -270,7 +293,10 @@ class SqlTransactionRepository:
             )
             return {**dict(row), "lease_token": token}
 
-    def finish_receipt(self, receipt, result, now, max_attempts, retry_seconds):
+    def finish_receipt(
+        self, receipt, result, now, max_attempts, retry_seconds, policy=None
+    ):
+        evaluator = policy or PolicyController()
         with self.connection(write=True) as db:
             current = db.execute(
                 "SELECT * FROM receipts WHERE id=?", (receipt["id"],)
@@ -278,19 +304,23 @@ class SqlTransactionRepository:
             # A worker whose lease was taken over cannot overwrite a newer result.
             if current["lease_token"] != receipt["lease_token"]:
                 return False
-            attempts = current["attempts"] + 1
-            if result.valid is None:
-                status = (
-                    ReceiptStatus.MANUAL_REVIEW
-                    if attempts >= max_attempts
-                    else ReceiptStatus.UNKNOWN
-                )
-            elif result.valid and result.recipient_id == receipt["seller_id"]:
-                status = (
-                    ReceiptStatus.DELIVERED if result.delivered else ReceiptStatus.VALID
-                )
-            else:
-                status = ReceiptStatus.INVALID
+            decision = evaluator.evaluate(
+                PolicyRequest(
+                    request_id=receipt["id"],
+                    action=Action.EVALUATE_RETURN_SHIPMENT,
+                    actor_id=None,
+                    received_at=now,
+                    payload={
+                        "shipment_result": result,
+                        "seller_id": receipt["seller_id"],
+                        "current_attempts": current["attempts"],
+                        "max_attempts": max_attempts,
+                    },
+                ),
+                PolicyContext(now=now),
+            )
+            status: ReceiptStatus = decision.metadata["receipt_status"]
+            attempts: int = decision.metadata["attempts"]
             db.execute(
                 """UPDATE receipts SET status=?, attempts=?, next_check_at=?,
                 lease_token=NULL, lease_until=NULL WHERE id=?""",
@@ -315,25 +345,31 @@ class SqlTransactionRepository:
             self.event(db, receipt["transaction_id"], now, messages[status])
             return True
 
-    def mark_mock_arrived(self, transaction_id, now):
+    def mark_mock_arrived(self, transaction_id, now, policy=None):
+        evaluator = policy or PolicyController()
         with self.connection(write=True) as db:
             transaction = self._snapshot(db, transaction_id)
-            if any(
-                r["status"] == ReceiptStatus.DELIVERED for r in transaction["receipts"]
-            ):
-                return
-            receipt = next(
-                (
-                    r
-                    for r in transaction["receipts"]
-                    if r["status"] == ReceiptStatus.VALID
+            decision = evaluator.evaluate(
+                PolicyRequest(
+                    request_id=f"arrive-{transaction_id}",
+                    action=Action.MARK_RETURN_ARRIVED,
+                    actor_id=None,
+                    received_at=now,
                 ),
-                None,
+                PolicyContext(
+                    now=now,
+                    transaction_version=transaction["version"],
+                    payment_held=True,
+                    transaction=transaction,
+                ),
             )
-            if receipt is None:
-                raise DomainError("유효성이 확인된 반품 운송장이 필요합니다.")
+            if decision.verdict == DecisionType.WAIT:
+                return
+            if decision.verdict == DecisionType.REJECT:
+                raise DomainError(decision.reason, decision.status_code)
             db.execute(
-                "UPDATE receipts SET status='DELIVERED' WHERE id=?", (receipt["id"],)
+                "UPDATE receipts SET status='DELIVERED' WHERE id=?",
+                (decision.metadata["receipt_id"],),
             )
             db.execute(
                 "UPDATE transactions SET version=version+1 WHERE id=?",
@@ -347,8 +383,47 @@ class SqlTransactionRepository:
         with self.connection() as db:
             return [
                 dict(r)
-                for r in db.execute("SELECT * FROM operations WHERE status='PENDING'")
+                for r in db.execute(
+                    "SELECT * FROM operations WHERE status IN ('PENDING', 'UNKNOWN')"
+                )
             ]
+
+    def claim_operation(self, now, lease_seconds=30, exclude_keys=()):
+        """Atomic work claim (DCD: tryClaimWork) with lease expiry handoff."""
+        token = str(uuid4())
+        with self.connection(write=True) as db:
+            rows = db.execute(
+                """SELECT o.*, t.version AS transaction_version
+                FROM operations o
+                JOIN transactions t ON t.id=o.transaction_id
+                WHERE o.status IN ('PENDING', 'UNKNOWN')
+                AND (o.lease_until IS NULL OR o.lease_until<=?)
+                ORDER BY o.rowid""",
+                (timestamp(now),),
+            ).fetchall()
+            row = next(
+                (r for r in rows if r["request_key"] not in exclude_keys),
+                None,
+            )
+            if row is None:
+                return None
+            db.execute(
+                "UPDATE operations SET lease_token=?, lease_until=? WHERE request_key=?",
+                (
+                    token,
+                    timestamp(now + timedelta(seconds=lease_seconds)),
+                    row["request_key"],
+                ),
+            )
+            return {**dict(row), "lease_token": token}
+
+    def find_mock_transfer(self, request_key):
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM mock_bank_transfers WHERE request_key=?",
+                (request_key,),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def record_mock_transfer(self, operation):
         with self.connection(write=True) as db:
@@ -377,28 +452,54 @@ class SqlTransactionRepository:
                 raise DomainError("은행 멱등키의 금전 지시 내용이 다릅니다.")
         return "SUCCEEDED"
 
-    def save_transfer_result(self, request_key, status, now):
+    def save_transfer_result(
+        self,
+        request_key,
+        status,
+        now,
+        *,
+        lease_token=None,
+        expected_version=None,
+    ):
         with self.connection(write=True) as db:
             row = db.execute(
-                "SELECT * FROM operations WHERE request_key=?", (request_key,)
+                """SELECT o.*, t.version AS transaction_version
+                FROM operations o
+                JOIN transactions t ON t.id=o.transaction_id
+                WHERE o.request_key=?""",
+                (request_key,),
             ).fetchone()
-            if row and row["status"] != status:
-                db.execute(
-                    "UPDATE operations SET status=? WHERE request_key=?",
-                    (status, request_key),
-                )
+            if row is None:
+                return False
+            if lease_token is not None and row["lease_token"] != lease_token:
+                return False
+            if (
+                expected_version is not None
+                and row["transaction_version"] != expected_version
+            ):
+                return False
+            db.execute(
+                """UPDATE operations
+                SET status=?, lease_token=NULL, lease_until=NULL
+                WHERE request_key=?""",
+                (status, request_key),
+            )
+            if row["status"] != status:
                 db.execute(
                     "UPDATE transactions SET version=version+1 WHERE id=?",
                     (row["transaction_id"],),
                 )
-                self.event(
-                    db,
-                    row["transaction_id"],
-                    now,
-                    "모의 은행: 판매자 지급 완료"
-                    if row["kind"] == "PAYOUT"
-                    else "모의 은행: 구매자 환불 완료",
-                )
+                kind_label = "판매자 지급" if row["kind"] == "PAYOUT" else "구매자 환불"
+                if status == OperationStatus.SUCCEEDED:
+                    message = f"모의 은행: {kind_label} 완료"
+                elif status == OperationStatus.UNKNOWN:
+                    message = f"모의 은행: {kind_label} 응답 미확인 · 재조회 대기"
+                elif status == OperationStatus.MANUAL_REVIEW:
+                    message = f"모의 은행: {kind_label} 거절 · 담당자 확인 필요"
+                else:
+                    message = f"모의 은행: {kind_label} 상태 변경 ({status})"
+                self.event(db, row["transaction_id"], now, message)
+            return True
 
     def transfer_count(self, kind):
         with self.connection() as db:

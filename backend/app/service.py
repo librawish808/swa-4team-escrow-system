@@ -3,15 +3,24 @@
 import asyncio
 
 from .domain import (
+    Action,
+    AllocationKind,
     BankPort,
     DeliveryPort,
+    DepositAllocation,
     DomainError,
-    PolicyController,
+    OperationStatus,
+    PolicyContext,
+    PolicyRequest,
     ReceiptStatus,
     ShipmentResult,
+    TransferAttempt,
+    TransferResult,
+    TransferStatus,
     timestamp,
     utc_now,
 )
+from .policy import PolicyController
 from .repository import SqlTransactionRepository
 
 
@@ -24,18 +33,19 @@ class TransactionService:
         clock=utc_now,
         max_attempts=3,
         retry_seconds=1.0,
+        policy: PolicyController | None = None,
     ):
         self.repository = repository
         self.delivery = delivery
         self.bank = bank
         self.clock = clock
-        self.policy = PolicyController()
+        self.policy = policy or PolicyController()
         self.max_attempts = max_attempts
         self.retry_seconds = retry_seconds
 
     def register_return_waybill(self, transaction_id, actor_id, request_id, waybill_no):
         return self.repository.accept_waybill(
-            transaction_id, actor_id, request_id, waybill_no, self.clock
+            transaction_id, actor_id, request_id, waybill_no, self.clock, self.policy
         )
 
     def evaluate(self, transaction_id, snapshot=None):
@@ -47,7 +57,8 @@ class TransactionService:
                 else self.repository.get(transaction_id)
             )
             now = self.clock()
-            decision = self.policy.evaluate(current, now)
+            policy_decision = self.policy.evaluate_return_deadline(current, now)
+            decision = policy_decision.metadata["decision"]
             if self.repository.claim_once(current, decision, now):
                 return decision
             snapshot = None
@@ -66,7 +77,7 @@ class TransactionService:
                 timeout=5.0,
             )
         except (TimeoutError, OSError):
-            result = ShipmentResult(None)
+            result = ShipmentResult(None, waybill_no=receipt["waybill_no"])
         saved = await asyncio.to_thread(
             self.repository.finish_receipt,
             receipt,
@@ -74,32 +85,125 @@ class TransactionService:
             self.clock(),
             self.max_attempts,
             self.retry_seconds,
+            self.policy,
         )
         if saved:
             await asyncio.to_thread(self.evaluate, receipt["transaction_id"])
 
+    async def _submit_transfer(self, operation: dict) -> TransferResult:
+        try:
+            if operation["kind"] == "PAYOUT":
+                return await asyncio.wait_for(
+                    self.bank.request_payout(
+                        operation["transaction_id"],
+                        operation["request_key"],
+                        operation,
+                    ),
+                    timeout=5.0,
+                )
+            return await asyncio.wait_for(
+                self.bank.request_refund(
+                    operation["transaction_id"],
+                    operation["request_key"],
+                    operation,
+                ),
+                timeout=5.0,
+            )
+        except (TimeoutError, OSError):
+            return TransferResult(operation["request_key"], TransferStatus.UNKNOWN)
+
+    async def _lookup_transfer(self, request_key: str) -> TransferResult:
+        try:
+            return await asyncio.wait_for(
+                self.bank.get_transfer_result(request_key),
+                timeout=5.0,
+            )
+        except (TimeoutError, OSError):
+            return TransferResult(request_key, TransferStatus.UNKNOWN)
+
+    def _evaluate_transfer_result(
+        self, operation: dict, result: TransferResult, now
+    ):
+        return self.policy.evaluate(
+            PolicyRequest(
+                request_id=operation["request_key"],
+                action=Action.HANDLE_TRANSFER_RESULT,
+                actor_id=None,
+                received_at=now,
+                payload={"bank_idempotent": True},
+            ),
+            PolicyContext(
+                now=now,
+                transaction_version=operation.get("transaction_version", 0),
+                allocation=DepositAllocation(
+                    kind=AllocationKind.PRINCIPAL,
+                    amount=operation["amount"],
+                    operation_id=operation["request_key"],
+                ),
+                attempt=TransferAttempt(
+                    request_key=result.request_key,
+                    recipient_account=operation["recipient_id"],
+                    status=result.status,
+                    bank_transaction_id=result.bank_transaction_id,
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _status_from_follow_up(follow_up) -> OperationStatus:
+        if Action.COMPLETE_OPERATION in follow_up.actions:
+            return OperationStatus.SUCCEEDED
+        if Action.ESCALATE_MANUAL_REVIEW in follow_up.actions:
+            return OperationStatus.MANUAL_REVIEW
+        return OperationStatus.UNKNOWN
+
     async def dispatch_transfers(self):
-        operations = await asyncio.to_thread(self.repository.pending_operations)
-        for operation in operations:
-            status = await self.bank.transfer(operation)
+        processed: set[str] = set()
+        while True:
+            operation = await asyncio.to_thread(
+                self.repository.claim_operation,
+                self.clock(),
+                30,
+                processed,
+            )
+            if operation is None:
+                break
+            processed.add(operation["request_key"])
+
+            if operation["status"] == OperationStatus.UNKNOWN:
+                result = await self._lookup_transfer(operation["request_key"])
+            else:
+                result = await self._submit_transfer(operation)
+
+            follow_up = self._evaluate_transfer_result(
+                operation, result, self.clock()
+            )
+            if Action.REPLAY_TRANSFER_SAME_KEY in follow_up.actions:
+                replay_result = await self._submit_transfer(operation)
+                follow_up = self._evaluate_transfer_result(
+                    operation, replay_result, self.clock()
+                )
+            next_status = self._status_from_follow_up(follow_up)
+
             await asyncio.to_thread(
                 self.repository.save_transfer_result,
                 operation["request_key"],
-                status,
+                next_status,
                 self.clock(),
+                lease_token=operation["lease_token"],
+                expected_version=operation["transaction_version"],
             )
 
     def mark_mock_arrived(self, transaction_id):
-        self.repository.mark_mock_arrived(transaction_id, self.clock())
+        self.repository.mark_mock_arrived(transaction_id, self.clock(), self.policy)
         self.evaluate(transaction_id)
 
     def get_transaction_status(self, transaction_id, actor_id=None):
         value = self.repository.get(transaction_id)
-        if actor_id is not None and actor_id not in (
-            value["buyer_id"],
-            value["seller_id"],
-        ):
-            raise DomainError("거래 참여자만 조회할 수 있습니다.", 403)
+        if actor_id is not None:
+            decision = self.policy.validate_read(value, actor_id, now=self.clock())
+            if not decision.approved:
+                raise DomainError(decision.reason, decision.status_code)
         receipts = value["receipts"]
         operations = value["operations"]
         label, status, held = "운송장 미접수", "RETURN_APPROVED", True
@@ -119,10 +223,15 @@ class TransactionService:
             held = False
             if operation["kind"] == "PAYOUT":
                 label, status = "판매자 지급 확인 중", "PAYOUT_PROCESSING"
-                if operation["status"] == "SUCCEEDED":
+                if operation["status"] == OperationStatus.SUCCEEDED:
                     label, status = "판매자 지급 완료", "COMPLETED"
-            elif operation["status"] == "SUCCEEDED":
-                label, status = "환불 완료", "CANCELLED"
+                elif operation["status"] == OperationStatus.MANUAL_REVIEW:
+                    label, status = "지급 실패 · 담당자 확인 필요", "MANUAL_REVIEW"
+            else:
+                if operation["status"] == OperationStatus.SUCCEEDED:
+                    label, status = "환불 완료", "CANCELLED"
+                elif operation["status"] == OperationStatus.MANUAL_REVIEW:
+                    label, status = "환불 실패 · 담당자 확인 필요", "MANUAL_REVIEW"
         return {
             "id": value["id"],
             "amount": value["amount"],
