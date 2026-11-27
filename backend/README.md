@@ -40,24 +40,92 @@ result = register_waybill(transaction_id, expected_version, seller_id, "TEST123"
 
 ## 로컬 API 데모
 
-backend 디렉터리에서 실행합니다. 은행·택배는 Mock이지만 DB에는 실제 가상 거래가 저장됩니다.
+위의 설치와 `.env` 설정을 마친 뒤 backend 디렉터리에서 실행합니다.
+은행·택배는 Mock이지만 DB에는 실제 가상 거래가 저장됩니다.
 
 ```bash
 .venv/bin/python -m uvicorn app.demo:app --host 127.0.0.1 --port 8000
 ```
 
-브라우저에서 http://127.0.0.1:8000/docs 를 엽니다.
+서버를 켠 상태에서 [Swagger UI](http://127.0.0.1:8000/docs)를 엽니다.
+이 주소는 공용 배포 주소가 아니라 각자 컴퓨터의 로컬 주소입니다.
+팀원도 자신의 컴퓨터에서 서버를 실행해야 접속할 수 있습니다. 종료는 터미널에서 `Ctrl+C`입니다.
 
-1. `POST /demo/transactions` → Try it out → Execute로 새 거래 ID를 받습니다.
-2. `POST /transactions/{transaction_id}/waybill`에 해당 ID를 넣습니다.
-3. 헤더 `X-Demo-Actor-Id`는 `10`, 본문은 `{"version":1,"waybill_no":"TEST123"}`로 실행합니다.
-4. 200과 `WAYBILL_REGISTERED`, version 3을 확인합니다.
-5. 같은 거래로 cancel에 헤더 `20`, 본문 `{"version":1}`을 보내면 409입니다.
-6. 취소 성공을 보려면 새 데모 거래를 생성하고 먼저 cancel을 실행합니다.
+### 1. 새 테스트 거래 생성
+
+1. `POST /demo/transactions`를 펼칩니다.
+2. **Try it out → Execute**를 누릅니다.
+3. 아래 **Server response**에서 Code `201`과 Response body의 `id`를 확인합니다.
+   이 거래는 구매자 `20`, 판매자 `10`, 입금액 `100000`, version `1`로 생성됩니다.
+
+거래 ID는 자동 생성되므로 화면에서 받은 값을 사용합니다. 아래 각 시나리오는 새 거래로 시작합니다.
+
+### 2. 운송장 등록 성공 후 취소 차단
+
+`POST /transactions/{transaction_id}/waybill`을 펼치고 **Try it out**을 누릅니다.
+
+- `transaction_id`: 방금 생성한 거래의 `id`
+- `X-Demo-Actor-Id`: `10` (판매자)
+- Request body:
+
+```json
+{
+  "version": 1,
+  "waybill_no": "TEST123"
+}
+```
+
+**Execute**를 누르면 Code `200`, status `WAYBILL_REGISTERED`, version `3`이 나와야 합니다.
+
+이어서 `POST /transactions/{transaction_id}/cancel`을 펼치고 **Try it out**을 누릅니다.
+
+- `transaction_id`: 운송장 등록에 사용한 **같은 거래 ID**
+- `X-Demo-Actor-Id`: `20` (구매자)
+- Request body:
+
+```json
+{
+  "version": 1
+}
+```
+
+**Execute**를 누르면 Code `409`가 나와야 합니다. 운송장 등록이 먼저 완료되어 취소가 차단된 것입니다.
+
+### 3. 취소 성공 후 운송장 등록 차단
+
+1. `POST /demo/transactions`로 **새 거래를 생성**하고 새 `id`를 확인합니다.
+2. cancel API에 새 거래 ID, 역할 `20`, 본문 `{"version": 1}`을 입력합니다.
+3. **Execute** 후 Code `200`, status `CANCELLED`, version `3`을 확인합니다.
+4. waybill API에 **취소한 같은 거래 ID**, 역할 `10`,
+   본문 `{"version": 1, "waybill_no": "TEST123"}`을 입력합니다.
+5. **Execute** 후 Code `409`를 확인합니다. 취소가 먼저 완료되어 운송장 등록이 차단된 것입니다.
+
+### 응답 확인과 입력 오류
+
+| Code | 의미 |
+| --- | --- |
+| `201` | 새 데모 거래 생성 성공 |
+| `200` | 운송장 등록 또는 취소 완료 |
+| `202` | 외부 처리 결과 확인 및 복구 필요 |
+| `409` | 거래 상태·버전 또는 요청 권한이 맞지 않아 거부 |
+| `422` | 필수 입력 누락 또는 형식 오류 |
+| `503` | DB 오류 또는 운영 앱의 인증/외부 Port 미설정 |
+
+성공 여부는 **Server response → Code / Response body**로 확인합니다.
+위쪽 **Curl**은 요청을 명령어로 표현한 것이며 성공 결과가 아닙니다.
+
+`422`이면 Response body의 `detail`을 확인합니다. 역할 헤더를 반드시 선택하고,
+취소 본문에는 `version`만 넣습니다. `buyer_id`, `seller_id`, `waybill_no`를 추가하지 않습니다.
+운송장 번호는 waybill API 본문에만 입력합니다. 역할 선택 칸이 안 보이면 페이지를 새로고침합니다.
+
+수동 데모 거래는 DB에 남습니다. 순서대로 보내는 수동 확인과 별개로,
+실제 동시 요청 검증은 아래 자동 테스트에서 실행합니다.
 
 외부 실패/불명확은 202와 `recovery_required=true`, DB 오류는 상세 정보를 숨긴 503입니다.
 로컬 데모의 역할 선택 헤더는 인증 기능이 아닙니다. 팀 인증은 `current_actor` 의존성에
 연결합니다. 데모 앱은 localhost에서만 실행하며 원격 클라이언트의 거래 요청을 차단합니다.
+
+## 처리 흐름
 
 1. 현재 상태, 버전, 소유자를 단일 UPDATE로 검사하고 처리 상태를 커밋합니다.
 2. 성공한 호출만 외부 Port를 실행합니다. Port에는 거래 금액과 멱등키를 전달합니다.
